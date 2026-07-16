@@ -14,7 +14,6 @@ Inputs arrive as CLI args:
   the ``lockfile-diff`` artifact). Only meaningful when ``--lockfile-changed``
   is ``true``.
 * ``--ci-reviewed`` — ``true`` / ``false`` / empty (job was skipped).
-* ``--mcp-reviewed`` — ``true`` / ``false`` / empty (job was skipped).
 
 Each section is only included when the corresponding job actually ran, so a
 PR that doesn't touch lockfiles or the MCP catalog gets a shorter comment.
@@ -26,7 +25,6 @@ Usage::
         --lockfile-changed "$LOCKFILE_CHANGED" \
         --lockfile-diff /tmp/lockfile-diff.md \
         --ci-reviewed "$CI_REVIEWED" \
-        --mcp-reviewed "$MCP_REVIEWED" \
         --output /tmp/comment-body.md
 """
 
@@ -108,7 +106,7 @@ def section_mcp_review(reviewed: bool | None) -> str:
     if reviewed:
         return (
             "### 🔧 MCP catalog security review\n\n"
-            "✅ The `mcp-catalog-reviewed` label is present on this PR.\n"
+            "✅ The `ci-reviewed` label is present on this PR.\n"
         )
     return (
         "### ⚠️ MCP catalog security review\n\n"
@@ -120,7 +118,7 @@ def section_mcp_review(reviewed: bool | None) -> str:
         "- stdio transports do not use shell+egress/exfiltration payloads,\n"
         "- git install refs are pinned and bootstrap commands are minimal,\n"
         "- requested env vars/secrets match the upstream MCP's documented needs.\n\n"
-        "After review, add the `mcp-catalog-reviewed` label and re-run this check.\n"
+        "After review, add the `ci-reviewed` label and re-run this check.\n"
     )
 
 
@@ -128,7 +126,6 @@ def assemble(
     lockfile_changed: bool | None,
     lockfile_diff: Path,
     ci_reviewed: bool | None,
-    mcp_reviewed: bool | None,
 ) -> str:
     """Assemble the full comment body from individual job outputs."""
     sections: list[str] = []
@@ -141,7 +138,7 @@ def assemble(
     if cr:
         sections.append(cr)
 
-    mr = section_mcp_review(mcp_reviewed)
+    mr = section_mcp_review(ci_reviewed)
     if mr:
         sections.append(mr)
 
@@ -178,11 +175,6 @@ def main() -> int:
         help="ci-reviewed label status: 'true', 'false', or empty (skipped).",
     )
     parser.add_argument(
-        "--mcp-reviewed",
-        default="",
-        help="mcp-catalog-reviewed label status: 'true', 'false', or empty (skipped).",
-    )
-    parser.add_argument(
         "--output",
         type=Path,
         required=True,
@@ -194,7 +186,6 @@ def main() -> int:
         lockfile_changed=_bool(args.lockfile_changed),
         lockfile_diff=args.lockfile_diff,
         ci_reviewed=_bool(args.ci_reviewed),
-        mcp_reviewed=_bool(args.mcp_reviewed),
     )
 
     args.output.write_text(body)

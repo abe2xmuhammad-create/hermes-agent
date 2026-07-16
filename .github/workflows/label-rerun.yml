@@ -1,0 +1,90 @@
+name: Label rerun
+
+# When the ``ci-reviewed`` label is added to a PR, automatically rerun the
+# ``review-labels`` job from the latest CI run so the security gate
+# re-evaluates without a manual ``gh run rerun``.
+#
+# Flow:
+#   1. Trigger on ``pull_request: types: [labeled]`` — filter for
+#      ``ci-reviewed``.
+#   2. Find the latest CI run for this PR.
+#   3. If the run is still in progress, wait for it to finish (the job
+#      can't be rerun while the run is active).
+#   4. Find the ``review-labels`` job in that run and rerun just that job.
+#      GitHub re-evaluates dependent jobs (``comment-results``,
+#      ``all-checks-pass``) automatically after the rerun.
+#
+# This workflow is read-only with respect to the CI run — it uses
+# ``actions: write`` to rerun jobs and ``pull-requests: read`` to find the
+# PR's runs. It never touches the PR directly.
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  actions: write # rerun jobs
+  pull-requests: read # find PR runs
+  checks: read # query job status
+
+concurrency:
+  group: label-rerun-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rerun-review-labels:
+    name: Rerun review-labels job
+    if: github.event.label.name == 'ci-reviewed'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Find and rerun the review-labels job
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+
+          # Find the latest CI workflow run for this PR.
+          RUN_ID=$(gh run list \
+            --repo "$REPO" \
+            --commit "$HEAD_SHA" \
+            --workflow ci.yml \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId' 2>/dev/null || true)
+
+          if [ -z "$RUN_ID" ]; then
+            echo "No CI run found for PR #$PR — nothing to rerun."
+            exit 0
+          fi
+
+          echo "Latest CI run: $RUN_ID"
+
+          # If the run is still in progress, wait for it to finish.
+          # ``gh run rerun --job`` only works on completed runs.
+          STATUS=$(gh run view "$RUN_ID" --repo "$REPO" --json status --jq '.status' 2>/dev/null || echo "unknown")
+          if [ "$STATUS" != "completed" ]; then
+            echo "Run is $STATUS — waiting for completion..."
+            gh run watch "$RUN_ID" --repo "$REPO" --exit-status --interval 15 || true
+          fi
+
+          # Find the review-labels job in the run. The job name in the
+          # orchestrator is "Review label gate" (the ``name:`` field in
+          # ci.yml), but ``gh run view --json jobs`` uses the ``name``
+          # field from the run's job list which matches the display name.
+          JOB_ID=$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \
+            --jq '.jobs[] | select(.name | test("Review label gate|review-labels")) | .databaseId' \
+            | head -1 || true)
+
+          if [ -z "$JOB_ID" ]; then
+            echo "review-labels job not found in run $RUN_ID."
+            echo "This is expected if the PR doesn't touch CI-sensitive files or the MCP catalog."
+            exit 0
+          fi
+
+          echo "Rerunning review-labels job: $JOB_ID"
+          gh run rerun --job "$JOB_ID" --repo "$REPO"
+          echo "Job rerun initiated. GitHub will re-evaluate dependent jobs (comment-results, all-checks-pass) automatically."

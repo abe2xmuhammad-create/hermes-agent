@@ -8,10 +8,8 @@ name: Lint (ruff + ty)
 #      Separate job so the advisory diff still runs even when enforcement
 #      fails.
 #
-# The ``ci-review`` job gates CI-sensitive file changes behind the
-# ``ci-reviewed`` label. It no longer posts its own PR comment — the review
-# status is exposed as a workflow_call output (``ci_reviewed``) so the CI
-# orchestrator's unified review-comment job can include the section.
+# CI-sensitive file review was previously here as a ``ci-review`` job but
+# has moved to ``review-labels.yml`` so it can be rerun independently.
 
 on:
   workflow_call:
@@ -20,18 +18,9 @@ on:
         description: The event name from the calling orchestrator (pull_request or push).
         type: string
         required: true
-      ci_review:
-        description: Whether CI-sensitive files (eslint config, workflows, actions) changed and require a review label.
-        type: boolean
-        default: false
-    outputs:
-      ci_reviewed:
-        description: Whether the ci-reviewed label is present. Empty when the ci-review job was skipped.
-        value: ${{ jobs.ci-review.outputs.reviewed }}
 
 permissions:
   contents: read
-  pull-requests: read # needed to read PR labels in ci-review
 
 concurrency:
   group: lint-${{ github.ref }}
@@ -171,47 +160,3 @@ jobs:
 
       - name: Run footgun checker
         run: python scripts/check-windows-footguns.py --all
-
-  ci-review:
-    # Require explicit maintainer review when CI-sensitive files change:
-    # eslint config, workflow YAMLs, or composite actions. These files
-    # influence what code the js-autofix job executes and pushes to
-    # main, so a malicious PR could inject arbitrary code via a custom eslint
-    # rule's `fix` function. The label gate ensures a human reviews before
-    # merge. Mirrors the mcp-catalog-reviewed pattern in supply-chain-audit.yml.
-    #
-    # The review status is exposed as a workflow_call output so the CI
-    # orchestrator's unified review-comment job can render the section.
-    # The blocking ``exit 1`` gate stays here.
-    name: CI-sensitive file review
-    if: inputs.event_name == 'pull_request' && inputs.ci_review
-    runs-on: ubuntu-latest
-    timeout-minutes: 2
-    outputs:
-      reviewed: ${{ steps.label-check.outputs.reviewed }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Require ci-reviewed label
-        id: label-check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          PR="${{ github.event.pull_request.number }}"
-          LABELS=$(gh pr view "$PR" --json labels --jq '.labels[].name' || true)
-          if echo "$LABELS" | grep -Fxq 'ci-reviewed'; then
-            echo "reviewed=true" >> "$GITHUB_OUTPUT"
-            echo "ci-reviewed label present."
-            exit 0
-          fi
-          echo "reviewed=false" >> "$GITHUB_OUTPUT"
-
-      # Fail the job when the label is missing — always runs (including
-      # fork PRs) so the security gate holds even when the comment step
-      # was skipped above.
-      - name: Fail on missing label
-        if: steps.label-check.outputs.reviewed != 'true'
-        run: |
-          echo "::error::CI-sensitive changes require the ci-reviewed label."
-          exit 1
