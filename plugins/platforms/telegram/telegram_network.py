@@ -195,6 +195,12 @@ async def _query_doh_provider(
 async def discover_fallback_ips() -> list[str]:
     """Auto-discover Telegram API IPs via DNS-over-HTTPS.
 
+    Returns the hardcoded seed fallback IPs **immediately** so the gateway can
+    start connecting without waiting for DoH.  DoH queries run in the background
+    to potentially discover fresher IPs; the result is cached in a module-level
+    variable so the next call (e.g. after a reconnect) picks up the DoH-discovered
+    IPs instead of the seeds.
+
     Resolves api.telegram.org through Google and Cloudflare DoH and returns all
     unique A records.  IPs that match the local system resolver are kept rather
     than excluded: in many networks the system-DNS IP is the most reliable path
@@ -203,50 +209,81 @@ async def discover_fallback_ips() -> list[str]:
     consulted (#14520).  Falls back to a hardcoded seed list only when DoH
     yields no usable answers.
     """
-    async with httpx.AsyncClient(timeout=httpx.Timeout(_DOH_TIMEOUT)) as client:
-        doh_tasks = [_query_doh_provider(client, p) for p in _DOH_PROVIDERS]
-        system_dns_task = asyncio.ensure_future(asyncio.to_thread(_resolve_system_dns))
-        results = await asyncio.gather(*doh_tasks, return_exceptions=True)
+    global _discovered_fallback_ips
 
-    # The system-resolver leg runs socket.getaddrinfo in a worker thread with
-    # no timeout of its own — a wedged OS resolver (broken VPN/DNS) can sit for
-    # minutes. Its result only feeds the no-usable-answers log line below, so
-    # it must never gate discovery: bound it and move on (#63309). The DoH legs
-    # are already bounded by the client timeout above.
-    system_ips: set[str] = set()
-    try:
-        system_result = await asyncio.wait_for(system_dns_task, timeout=_DOH_TIMEOUT)
-        if isinstance(system_result, set):
-            system_ips = system_result
-    except Exception:
-        logger.debug("System-DNS resolution for %s did not complete in time", _TELEGRAM_API_HOST)
+    # Return cached DoH-discovered IPs if we already ran discovery once.
+    if _discovered_fallback_ips is not None:
+        return _discovered_fallback_ips
 
-    doh_ips: list[str] = []
-    for r in results:
-        if isinstance(r, list):
-            doh_ips.extend(r)
+    # Return seeds immediately; kick off DoH in background. This keeps the
+    # gateway connecting to Telegram without waiting on DoH — critical for
+    # alert delivery on cold start (cron alerts can't block on discovery).
+    _discovered_fallback_ips = list(_SEED_FALLBACK_IPS)
 
-    # Deduplicate preserving order
-    seen: set[str] = set()
-    candidates: list[str] = []
-    for ip in doh_ips:
-        if ip not in seen:
-            seen.add(ip)
-            candidates.append(ip)
+    async def _background_discovery() -> None:
+        """Run DoH + system DNS in background and update the cache."""
+        global _discovered_fallback_ips
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(_DOH_TIMEOUT)) as client:
+                doh_tasks = [_query_doh_provider(client, p) for p in _DOH_PROVIDERS]
+                # System-DNS leg runs socket.getaddrinfo in a worker thread with
+                # no timeout of its own — a wedged OS resolver (broken VPN/DNS)
+                # can sit for minutes. Start it as a future so we can bound it
+                # below with asyncio.wait_for (#63309). DoH legs are already
+                # bounded by the client timeout above.
+                system_dns_task = asyncio.ensure_future(asyncio.to_thread(_resolve_system_dns))
+                doh_results = await asyncio.gather(*doh_tasks, return_exceptions=True)
 
-    # Validate through existing normalization
-    validated = _normalize_fallback_ips(candidates)
+            system_ips: set[str] = set()
+            try:
+                system_result = await asyncio.wait_for(system_dns_task, timeout=_DOH_TIMEOUT)
+                if isinstance(system_result, set):
+                    system_ips = system_result
+            except Exception:
+                logger.debug("System-DNS resolution for %s did not complete in time", _TELEGRAM_API_HOST)
 
-    if validated:
-        logger.debug("Discovered Telegram fallback IPs via DoH: %s", ", ".join(validated))
-        return validated
+            doh_ips: list[str] = []
+            for r in doh_results:
+                if isinstance(r, list):
+                    doh_ips.extend(r)
+
+            seen: set[str] = set()
+            candidates: list[str] = []
+            for ip in doh_ips:
+                if ip not in seen:
+                    seen.add(ip)
+                    candidates.append(ip)
+
+            validated = _normalize_fallback_ips(candidates)
+
+            if validated:
+                logger.debug(
+                    "Discovered Telegram fallback IPs via DoH: %s",
+                    ", ".join(validated),
+                )
+                _discovered_fallback_ips = validated
+            else:
+                logger.info(
+                    "DoH discovery yielded no usable IPs (system DNS: %s); "
+                    "keeping seed fallback IPs %s",
+                    ", ".join(system_ips) or "unknown",
+                    ", ".join(_SEED_FALLBACK_IPS),
+                )
+        except Exception as exc:
+            logger.debug("Background DoH discovery failed: %s", exc)
+
+    asyncio.create_task(_background_discovery())
 
     logger.info(
-        "DoH discovery yielded no usable IPs (system DNS: %s); using seed fallback IPs %s",
-        ", ".join(system_ips) or "unknown",
+        "Returning seed fallback IPs immediately (DoH discovery running in background): %s",
         ", ".join(_SEED_FALLBACK_IPS),
     )
     return list(_SEED_FALLBACK_IPS)
+
+
+# Module-level cache for DoH-discovered fallback IPs.
+# None = not yet probed; list = last known good IPs (seeds or DoH-discovered).
+_discovered_fallback_ips: Optional[list[str]] = None
 
 
 def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:

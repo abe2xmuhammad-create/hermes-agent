@@ -3017,8 +3017,19 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 90
+        # Max iterations — per-job override for hard one-shot cron discipline.
+        # Default remains config agent.max_turns (or 90). Packet jobs should set
+        # max_iterations=1 so a tool-call cannot burn multi-turn token loops.
+        max_iterations = (
+            job.get("max_iterations")
+            or _cfg.get("agent", {}).get("max_turns")
+            or _cfg.get("max_turns")
+            or 90
+        )
+        try:
+            max_iterations = max(1, int(max_iterations))
+        except (TypeError, ValueError):
+            max_iterations = 90
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
