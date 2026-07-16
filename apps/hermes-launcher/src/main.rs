@@ -168,7 +168,14 @@ fn adopt(from_checkout: Option<String>, source: Option<String>, undo: bool) -> a
         }
     };
 
-    adopt::adopt(&hermes_home, &checkout, source.as_deref(), undo)
+    let trusted_pubkey = if undo { "" } else { trusted_release_pubkey()? };
+    adopt::adopt(
+        &hermes_home,
+        &checkout,
+        source.as_deref(),
+        undo,
+        trusted_pubkey,
+    )
 }
 
 fn self_restage() -> anyhow::Result<()> {

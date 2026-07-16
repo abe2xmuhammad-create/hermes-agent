@@ -23,7 +23,9 @@ pub fn apply_release(request: ApplyRequest<'_>) -> Result<Manifest> {
         None => request.source.latest(request.channel)?,
     };
     let platform = current_platform()?;
-    let (bundle_url, _, _) = request.source.resolve(&version, &platform)?;
+    let (bundle_url, _, _) = request
+        .source
+        .resolve(&version, &platform, request.channel)?;
 
     fs::create_dir_all(slots::versions_dir(request.hermes_home))?;
     slots::cleanup_stale_staging(request.hermes_home)?;
@@ -35,7 +37,7 @@ pub fn apply_release(request: ApplyRequest<'_>) -> Result<Manifest> {
 
     let result = (|| -> Result<Manifest> {
         download_blocking(request.source, &bundle_url, &archive)?;
-        unpack_tar_zst(&archive, &staging)?;
+        unpack_archive(&archive, &staging, &platform)?;
         normalize_archive_root(&staging)?;
         let manifest = crate::release::verify_bundle(&staging, Some(request.trusted_pubkey))?;
         if manifest.version != version {
@@ -161,6 +163,37 @@ fn unpack_tar_zst(archive_path: &Path, destination: &Path) -> Result<()> {
     archive
         .unpack(destination)
         .with_context(|| format!("cannot unpack bundle into {}", destination.display()))
+}
+
+fn unpack_archive(archive_path: &Path, destination: &Path, platform: &str) -> Result<()> {
+    if platform.starts_with("win-") {
+        unpack_zip(archive_path, destination)
+    } else {
+        unpack_tar_zst(archive_path, destination)
+    }
+}
+
+fn unpack_zip(archive_path: &Path, destination: &Path) -> Result<()> {
+    let archive_file = fs::File::open(archive_path)
+        .with_context(|| format!("cannot open {}", archive_path.display()))?;
+    let mut archive = zip::ZipArchive::new(archive_file).context("invalid zip bundle")?;
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let relative = entry
+            .enclosed_name()
+            .ok_or_else(|| anyhow::anyhow!("zip entry escapes bundle root: {}", entry.name()))?;
+        let output = destination.join(relative);
+        if entry.is_dir() {
+            fs::create_dir_all(&output)?;
+            continue;
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::File::create(&output)?;
+        std::io::copy(&mut entry, &mut file)?;
+    }
+    Ok(())
 }
 
 fn normalize_archive_root(staging: &Path) -> Result<()> {
@@ -354,5 +387,30 @@ mod tests {
             assert!(fields[1].parse::<u64>().is_ok());
         }
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn zip_extraction_preserves_bundle_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let archive_path = temp.path().join("bundle.zip");
+        let file = fs::File::create(&archive_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "bundle/manifest.json",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        use std::io::Write;
+        zip.write_all(b"{}\n").unwrap();
+        zip.finish().unwrap();
+
+        let destination = temp.path().join("out");
+        fs::create_dir(&destination).unwrap();
+        unpack_zip(&archive_path, &destination).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("bundle/manifest.json")).unwrap(),
+            "{}\n"
+        );
     }
 }

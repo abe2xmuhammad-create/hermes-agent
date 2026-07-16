@@ -68,6 +68,27 @@ jobs:
         with:
           python-version: "3.12"  # for running write-manifest.py; the bundle uses its own 3.11
 
+      - name: Configure release signing
+        shell: bash
+        env:
+          HERMES_SIGNING_KEY: ${{ secrets.HERMES_SIGNING_KEY }}
+        run: |
+          test -n "$HERMES_SIGNING_KEY" || {
+            echo "::error::HERMES_SIGNING_KEY is required for release bundles"
+            exit 1
+          }
+          python -m pip install --disable-pip-version-check pynacl==1.5.0
+          PUBLIC_KEY=$(HERMES_SIGNING_KEY="$HERMES_SIGNING_KEY" python - <<'PY'
+          import base64
+          import os
+          import nacl.signing
+
+          key = nacl.signing.SigningKey(base64.b64decode(os.environ["HERMES_SIGNING_KEY"]))
+          print(base64.b64encode(bytes(key.verify_key)).decode())
+          PY
+          )
+          echo "HERMES_RELEASE_PUBLIC_KEY=$PUBLIC_KEY" >> "$GITHUB_ENV"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
@@ -104,29 +125,16 @@ jobs:
 
       - name: Write and sign manifest
         shell: bash
+        env:
+          HERMES_SIGNING_KEY: ${{ secrets.HERMES_SIGNING_KEY }}
         run: |
-          # Write manifest.json with file hashes
           python scripts/release/write-manifest.py \
             --bundle-dir dist/bundle \
+            --signing-key "$HERMES_SIGNING_KEY" \
             --version "${{ steps.version.outputs.version }}" \
             --channel "${{ steps.version.outputs.channel }}" \
             --git-sha "${{ github.sha }}" \
             --platform "${{ matrix.platform }}"
-
-          # Sign if the Ed25519 secret key is available
-          if [ -n "$HERMES_SIGNING_KEY" ]; then
-            python scripts/release/write-manifest.py \
-              --bundle-dir dist/bundle \
-              --signing-key "$HERMES_SIGNING_KEY" \
-              --version "${{ steps.version.outputs.version }}" \
-              --channel "${{ steps.version.outputs.channel }}" \
-              --git-sha "${{ github.sha }}" \
-              --platform "${{ matrix.platform }}"
-          else
-            echo "::warning::HERMES_SIGNING_KEY not set — unsigned bundle"
-          fi
-        env:
-          HERMES_SIGNING_KEY: ${{ secrets.HERMES_SIGNING_KEY }}
 
       - name: Smoke test — bundle boots
         shell: bash
@@ -143,7 +151,10 @@ jobs:
       - name: Smoke test — manifest verifies
         shell: bash
         run: |
-          python scripts/release/write-manifest.py --verify --bundle-dir dist/bundle
+          python scripts/release/write-manifest.py \
+            --verify \
+            --bundle-dir dist/bundle \
+            --pubkey "$HERMES_RELEASE_PUBLIC_KEY"
 
       - name: Create bundle archive
         shell: bash

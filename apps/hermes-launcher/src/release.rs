@@ -32,6 +32,17 @@ pub struct Signature {
     pub signature: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct GithubAsset {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubAsset>,
+}
+
 /// A release source — where bundles come from.
 #[derive(Debug, Clone)]
 pub enum ReleaseSource {
@@ -63,8 +74,18 @@ impl ReleaseSource {
 
     /// Resolve the URLs for a given version + platform.
     /// Returns (bundle_url, manifest_url, sig_url).
-    pub fn resolve(&self, version: &str, platform: &str) -> Result<(String, String, String)> {
-        let bundle_name = format!("hermes-{}-{}.tar.zst", version, platform);
+    pub fn resolve(
+        &self,
+        version: &str,
+        platform: &str,
+        channel: &str,
+    ) -> Result<(String, String, String)> {
+        let extension = if platform.starts_with("win-") {
+            "zip"
+        } else {
+            "tar.zst"
+        };
+        let bundle_name = format!("hermes-{}-{}.{}", version, platform, extension);
         let manifest_name = "manifest.json";
         let sig_name = "manifest.json.sig";
 
@@ -78,7 +99,12 @@ impl ReleaseSource {
                 ))
             }
             ReleaseSource::Https { base_url } => {
-                let base = format!("{}/{}", base_url.trim_end_matches('/'), version);
+                let tag = if channel == "nightly" {
+                    "hermes-nightly".to_owned()
+                } else {
+                    format!("v{}", version.trim_start_matches('v'))
+                };
+                let base = format!("{}/{}", base_url.trim_end_matches('/'), tag);
                 Ok((
                     format!("{}/{}", base, bundle_name),
                     format!("{}/{}", base, manifest_name),
@@ -100,14 +126,7 @@ impl ReleaseSource {
                 })?;
                 Ok(content.trim().to_string())
             }
-            ReleaseSource::Https { base_url } => {
-                // TODO: GitHub Releases API call. For now, construct the URL
-                // and let the caller decide. This is implemented in task 1.4's
-                // apply flow which has the reqwest client.
-                bail!(
-                    "https:// latest() not yet implemented — use file:// for E2E tests, or specify --version"
-                )
-            }
+            ReleaseSource::Https { base_url } => latest_http(base_url, channel),
         }
     }
 
@@ -120,22 +139,88 @@ impl ReleaseSource {
                 .with_context(|| format!("failed to copy {} to {}", src, dest.display()))?;
             Ok(())
         } else {
-            // HTTP download (task 1.4's apply flow uses this with reqwest)
             let client = reqwest::Client::new();
-            let resp = client
+            let mut resp = client
                 .get(url)
+                .header(reqwest::header::USER_AGENT, "hermes-updater")
                 .send()
                 .await
                 .with_context(|| format!("HTTP GET failed: {}", url))?;
             if !resp.status().is_success() {
                 bail!("HTTP {} for {}", resp.status(), url);
             }
-            let bytes = resp.bytes().await.context("failed to read response body")?;
-            std::fs::write(dest, &bytes)
-                .with_context(|| format!("failed to write {}", dest.display()))?;
+            let mut file = std::fs::File::create(dest)
+                .with_context(|| format!("failed to create {}", dest.display()))?;
+            use std::io::Write;
+            while let Some(chunk) = resp
+                .chunk()
+                .await
+                .context("failed to stream response body")?
+            {
+                file.write_all(&chunk)
+                    .with_context(|| format!("failed to write {}", dest.display()))?;
+            }
+            file.sync_all()
+                .with_context(|| format!("failed to sync {}", dest.display()))?;
             Ok(())
         }
     }
+}
+
+fn latest_http(base_url: &str, channel: &str) -> Result<String> {
+    let repo = base_url
+        .strip_prefix("https://github.com/")
+        .and_then(|path| path.strip_suffix("/releases/download"))
+        .ok_or_else(|| anyhow::anyhow!("unsupported GitHub release URL: {}", base_url))?;
+    let release_path = if channel == "nightly" {
+        "releases/tags/hermes-nightly"
+    } else {
+        "releases/latest"
+    };
+    let endpoint = format!("https://api.github.com/repos/{}/{}", repo, release_path);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("cannot create release lookup runtime")?;
+    let release: GithubRelease = runtime.block_on(async {
+        reqwest::Client::new()
+            .get(&endpoint)
+            .header(reqwest::header::USER_AGENT, "hermes-updater")
+            .send()
+            .await
+            .with_context(|| format!("release lookup failed: {}", endpoint))?
+            .error_for_status()
+            .with_context(|| format!("release lookup failed: {}", endpoint))?
+            .json()
+            .await
+            .context("failed to decode release response")
+    })?;
+    release_version(&release, channel)
+}
+
+fn release_version(release: &GithubRelease, channel: &str) -> Result<String> {
+    if channel != "nightly" {
+        return Ok(release.tag_name.trim_start_matches('v').to_owned());
+    }
+    const SUFFIXES: &[&str] = &[
+        "-linux-x64.tar.zst",
+        "-linux-arm64.tar.zst",
+        "-darwin-arm64.tar.zst",
+        "-win-x64.zip",
+    ];
+    let mut versions = release.assets.iter().filter_map(|asset| {
+        let rest = asset.name.strip_prefix("hermes-")?;
+        SUFFIXES
+            .iter()
+            .find_map(|suffix| rest.strip_suffix(suffix).map(str::to_owned))
+    });
+    let version = versions
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("nightly release has no Hermes bundle assets"))?;
+    if versions.any(|candidate| candidate != version) {
+        bail!("nightly release contains multiple bundle versions");
+    }
+    Ok(version)
 }
 
 /// Verify a bundle directory: signature + file hashes.
@@ -390,10 +475,52 @@ mod tests {
     #[test]
     fn test_file_source_resolve() {
         let src = ReleaseSource::parse("file:///tmp/releases").unwrap();
-        let (bundle, manifest, sig) = src.resolve("2026.07.15", "linux-x64").unwrap();
+        let (bundle, manifest, sig) = src.resolve("2026.07.15", "linux-x64", "stable").unwrap();
         assert!(bundle.contains("hermes-2026.07.15-linux-x64.tar.zst"));
         assert!(manifest.contains("manifest.json"));
         assert!(sig.contains("manifest.json.sig"));
+    }
+
+    #[test]
+    fn test_windows_source_resolves_zip() {
+        let src = ReleaseSource::parse("https://github.com/acme/hermes/releases/download").unwrap();
+        let (bundle, _, _) = src.resolve("1.2.3", "win-x64", "stable").unwrap();
+        assert_eq!(
+            bundle,
+            "https://github.com/acme/hermes/releases/download/v1.2.3/hermes-1.2.3-win-x64.zip"
+        );
+    }
+
+    #[test]
+    fn test_nightly_version_comes_from_assets() {
+        let release = GithubRelease {
+            tag_name: "hermes-nightly".to_owned(),
+            assets: vec![
+                GithubAsset {
+                    name: "hermes-2026.07.16-linux-x64.tar.zst".to_owned(),
+                },
+                GithubAsset {
+                    name: "hermes-2026.07.16-win-x64.zip".to_owned(),
+                },
+            ],
+        };
+        assert_eq!(release_version(&release, "nightly").unwrap(), "2026.07.16");
+    }
+
+    #[test]
+    fn test_nightly_rejects_mixed_asset_versions() {
+        let release = GithubRelease {
+            tag_name: "hermes-nightly".to_owned(),
+            assets: vec![
+                GithubAsset {
+                    name: "hermes-2026.07.15-linux-x64.tar.zst".to_owned(),
+                },
+                GithubAsset {
+                    name: "hermes-2026.07.16-win-x64.zip".to_owned(),
+                },
+            ],
+        };
+        assert!(release_version(&release, "nightly").is_err());
     }
 
     #[test]

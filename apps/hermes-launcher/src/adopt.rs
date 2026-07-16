@@ -4,8 +4,8 @@
 //! See docs/updater-world.md §2.13 and
 //! docs/plans/updater-rework/03-phase2-compat-and-adoption.md task 2.6.
 
-use crate::release::{self, ReleaseSource};
-use crate::slots;
+use crate::apply::{self, ApplyRequest};
+use crate::release::ReleaseSource;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -16,81 +16,39 @@ pub fn adopt(
     from_checkout: &Path,
     source: Option<&str>,
     undo: bool,
+    trusted_pubkey: &str,
 ) -> Result<()> {
     if undo {
         return adopt_undo(hermes_home);
     }
 
-    // 1. Read the checkout's git SHA (for choosing the matching bundle)
     let git_sha = read_checkout_sha(from_checkout)?;
+    let checkout_state = read_checkout_state(from_checkout)?;
     println!(
         "==> Adopting from checkout: {} ({})",
         from_checkout.display(),
         &git_sha[..8]
     );
 
-    // 2. Determine the release source
-    let source_url = source.unwrap_or("https://github.com/NousResearch/hermes-agent/releases");
+    let source_url =
+        source.unwrap_or("https://github.com/NousResearch/hermes-agent/releases/download");
     let release_source = ReleaseSource::parse(source_url)?;
+    let manifest = apply::apply_release(ApplyRequest {
+        hermes_home,
+        source: &release_source,
+        version: None,
+        channel: "stable",
+        trusted_pubkey,
+    })?;
+    let version = manifest.version;
+    let slot = hermes_home.join("versions").join(&version);
+    apply::activate_stable_launchers(hermes_home, &version)?;
 
-    // 3. Find the latest version for the stable channel
-    let version = match &release_source {
-        ReleaseSource::File { base_path } => {
-            let latest_file = base_path.join("latest-stable.txt");
-            if latest_file.exists() {
-                std::fs::read_to_string(&latest_file)?.trim().to_string()
-            } else {
-                bail!("no latest-stable.txt found in file:// source — specify --version")
-            }
-        }
-        ReleaseSource::Https { .. } => {
-            // TODO: GitHub Releases API call. For now, require a version.
-            bail!("https:// source not yet implemented for adopt — use file:// for testing")
-        }
-    };
-    println!("==> Target version: {}", version);
-
-    // 4. Download the bundle
-    let platform = detect_platform()?;
-    let (bundle_url, manifest_url, sig_url) = release_source.resolve(&version, &platform)?;
-
-    let staging = slots::stage(hermes_home, &version)?;
-    println!("==> Staging to: {}", staging.display());
-
-    // Download bundle archive
-    let archive_path = staging.join(format!("hermes-{}-{}.tar.zst", version, platform));
-    println!("==> Downloading bundle...");
-    // For file:// sources, download is a local copy
-    let bundle_url_stripped = bundle_url.strip_prefix("file://").unwrap_or(&bundle_url);
-    if Path::new(bundle_url_stripped).exists() {
-        std::fs::copy(bundle_url_stripped, &archive_path)
-            .context("failed to copy bundle archive")?;
+    let launcher = hermes_home.join("bin").join(if cfg!(windows) {
+        "hermes.exe"
     } else {
-        // TODO: HTTP download (task 1.3's download() is async)
-        bail!("HTTP download not yet implemented — use file:// for testing");
-    }
-
-    // Unpack the bundle into staging
-    println!("==> Unpacking bundle...");
-    unpack_bundle(&archive_path, &staging)?;
-
-    // 5. Verify the bundle
-    println!("==> Verifying bundle...");
-    let manifest = release::verify_bundle(&staging, None)?;
-    println!("    Manifest verified: {} files", manifest.files.len());
-
-    // 6. Commit staging → slot
-    println!("==> Committing slot...");
-    let slot = slots::commit_staging(hermes_home, &version)?;
-    println!("    Slot at: {}", slot.display());
-
-    // 7. Flip current.txt
-    println!("==> Flipping...");
-    slots::flip(hermes_home, &version)?;
-    println!("    current.txt → {}", version);
-
-    // 8. Re-point the PATH symlink
-    let launcher = hermes_home.join("bin").join("hermes");
+        "hermes"
+    });
     let link_dir = find_command_link_dir()?;
     let symlink_path = link_dir.join("hermes");
 
@@ -122,16 +80,15 @@ pub fn adopt(
         launcher.display()
     );
 
-    // 9. Verify the checkout is untouched
     let new_sha = read_checkout_sha(from_checkout)?;
-    if new_sha != git_sha {
+    if new_sha != git_sha || read_checkout_state(from_checkout)? != checkout_state {
         bail!(
-            "CHECKOUT WAS MODIFIED! Expected {}, got {}. The checkout should be untouched.",
+            "checkout was modified during adoption (HEAD expected {}, got {})",
             git_sha,
             new_sha
         );
     }
-    println!("==> Checkout untouched (SHA unchanged)");
+    println!("==> Checkout untouched");
 
     println!();
     println!("✓ Adoption complete!");
@@ -190,25 +147,19 @@ fn read_checkout_sha(checkout: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// Detect the current platform string (e.g., "linux-x64").
-fn detect_platform() -> Result<String> {
-    let os = std::env::consts::OS;
-    let arch = std::env::consts::ARCH;
-
-    let plat_os = match os {
-        "linux" => "linux",
-        "macos" => "darwin",
-        "windows" => "win",
-        _ => bail!("unsupported OS: {}", os),
-    };
-
-    let plat_arch = match arch {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        _ => bail!("unsupported arch: {}", arch),
-    };
-
-    Ok(format!("{}-{}", plat_os, plat_arch))
+fn read_checkout_state(checkout: &Path) -> Result<Vec<u8>> {
+    let output = std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .current_dir(checkout)
+        .output()
+        .context("failed to run git status")?;
+    if !output.status.success() {
+        bail!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(output.stdout)
 }
 
 /// Find the command link directory (~/.local/bin, /usr/local/bin, etc.)
@@ -233,38 +184,9 @@ fn find_command_link_dir() -> Result<PathBuf> {
     Ok(local_bin)
 }
 
-/// Unpack a .tar.zst bundle into a directory.
-fn unpack_bundle(archive: &Path, dest: &Path) -> Result<()> {
-    let output = std::process::Command::new("tar")
-        .arg("--zstd")
-        .arg("-xf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dest)
-        .output()
-        .context("failed to run tar")?;
-
-    if !output.status.success() {
-        bail!(
-            "tar extraction failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_detect_platform() {
-        let platform = detect_platform().unwrap();
-        assert!(
-            platform.contains("linux") || platform.contains("darwin") || platform.contains("win")
-        );
-    }
 
     #[test]
     fn test_read_checkout_sha_invalid_dir() {
